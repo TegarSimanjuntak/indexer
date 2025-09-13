@@ -33,6 +33,9 @@ class ProcessReq(BaseModel):
     max_chunk_size: Optional[int] = 800
     overlap_ratio: Optional[float] = 0.1
 
+class EmbedReq(BaseModel):
+    text: str
+    mode: str | None = "query"  # "query" / "passage"
 
 @app.get("/health")
 def health():
@@ -149,6 +152,11 @@ def process_document(req: ProcessReq):
         "chunks": n_chunks,
     }
 
+@app.post("/embed/query")
+def embed_query(req: EmbedReq):
+    prefix = "query:" if (req.mode or "query").lower() == "query" else "passage:"
+    vec = model.encode([f"{prefix} {req.text or ''}"], normalize_embeddings=True, show_progress_bar=False)[0]
+    return {"embedding": vec.astype(np.float32).tolist(), "dim": len(vec)}
 
 # Alias lama untuk kompatibilitas
 @app.post("/embed/document")
