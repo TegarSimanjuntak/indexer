@@ -6,7 +6,7 @@ from typing import List, Optional, Dict, Any
 from uuid import UUID
 
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from supabase import create_client
@@ -39,9 +39,11 @@ class ProcessReq(BaseModel):
     max_chunk_size: Optional[int] = 800
     overlap_ratio: Optional[float] = 0.1
 
+
 class EmbedReq(BaseModel):
     text: str
     mode: str | None = "query"  # "query" / "passage"
+
 
 class SearchReq(BaseModel):
     question: str
@@ -65,9 +67,17 @@ def pdf_to_text(data: bytes) -> tuple[str, int]:
 
 
 def embed_passages(texts: List[str]) -> List[List[float]]:
-    texts = [f"passage: {t or ''}" for t in texts]  # e5 needs prefix
+    # prefix sesuai kebutuhan model
+    texts = [f"passage: {t or ''}" for t in texts]
     vecs = model.encode(texts, normalize_embeddings=True, batch_size=32, show_progress_bar=False)
-    return vecs.astype(np.float32).tolist()
+    # pastikan mengembalikan Python nested list of float
+    out = []
+    for v in vecs:
+        if hasattr(v, "tolist"):
+            out.append([float(x) for x in v.tolist()])
+        else:
+            out.append([float(x) for x in list(v)])
+    return out
 
 
 def _build_chunker(req: ProcessReq) -> ImprovedSemanticChunker:
@@ -126,21 +136,32 @@ def resolve_document_record(document_id: str) -> Optional[Dict[str, Any]]:
      - id (uuid)
      - storage_path
      - filename
-    Returns normalized dict or None.
+    Returns the row dict or None.
     """
     try:
+        # try id (uuid)
         if is_uuid(document_id):
             q = sb.table("documents").select("*").eq("id", document_id).limit(1).execute()
-            if q and getattr(q, "data", None):
-                return q.data[0] if isinstance(q.data, list) else q.data
+            if getattr(q, "error", None):
+                # continue to other resolution attempts
+                pass
+            else:
+                data = getattr(q, "data", None)
+                if data:
+                    # Postgrest may return list
+                    return data[0] if isinstance(data, list) else data
+
         # try storage_path
         q = sb.table("documents").select("*").eq("storage_path", document_id).limit(1).execute()
-        if q and getattr(q, "data", None):
-            return q.data[0] if isinstance(q.data, list) else q.data
+        if not getattr(q, "error", None) and getattr(q, "data", None):
+            data = getattr(q, "data")
+            return data[0] if isinstance(data, list) else data
+
         # try filename
         q = sb.table("documents").select("*").eq("filename", document_id).limit(1).execute()
-        if q and getattr(q, "data", None):
-            return q.data[0] if isinstance(q.data, list) else q.data
+        if not getattr(q, "error", None) and getattr(q, "data", None):
+            data = getattr(q, "data")
+            return data[0] if isinstance(data, list) else data
     except Exception as e:
         print("resolve_document_record exception:", e)
     return None
@@ -148,7 +169,7 @@ def resolve_document_record(document_id: str) -> Optional[Dict[str, Any]]:
 
 # ===================== M3: Process Document =====================
 @app.post("/process/document")
-def process_document(req: ProcessReq):
+def process_document(req: ProcessReq, request: Request):
     """
     Steps:
       1) resolve document record (support uuid OR storage_path/filename)
@@ -177,6 +198,13 @@ def process_document(req: ProcessReq):
         if not storage_path:
             return JSONResponse(status_code=400, content={"ok": False, "error": "missing storage_path on document"})
 
+        # mark processing (best-effort) so UI / backend can see it quickly
+        try:
+            if doc_id and is_uuid(str(doc_id)):
+                sb.table("documents").update({"status": "processing"}).eq("id", doc_id).execute()
+        except Exception as e:
+            print("warning: could not set status=processing:", e)
+
         # 2) download
         try:
             data_resp = sb.storage.from_(BUCKET).download(storage_path)
@@ -184,6 +212,11 @@ def process_document(req: ProcessReq):
         except Exception as e:
             tb = traceback.format_exc()
             print("download error:", e, tb)
+            try:
+                if doc_id and is_uuid(str(doc_id)):
+                    sb.table("documents").update({"status": "error"}).eq("id", doc_id).execute()
+            except Exception:
+                pass
             return JSONResponse(status_code=500, content={"ok": False, "error": "download failed", "detail": str(e), "trace": tb})
 
         # 3) extract
@@ -193,14 +226,16 @@ def process_document(req: ProcessReq):
             tb = traceback.format_exc()
             print("pdf parse error:", e, tb)
             try:
-                sb.table("documents").update({"status": "error"}).eq("id", doc_id).execute()
-            except Exception as _:
+                if doc_id and is_uuid(str(doc_id)):
+                    sb.table("documents").update({"status": "error"}).eq("id", doc_id).execute()
+            except Exception:
                 pass
             return JSONResponse(status_code=500, content={"ok": False, "error": "pdf parse failed", "detail": str(e), "trace": tb})
 
         if not text:
             try:
-                sb.table("documents").update({"status": "error"}).eq("id", doc_id).execute()
+                if doc_id and is_uuid(str(doc_id)):
+                    sb.table("documents").update({"status": "error"}).eq("id", doc_id).execute()
             except Exception:
                 pass
             return JSONResponse(status_code=400, content={"ok": False, "error": "empty text after extraction"})
@@ -218,27 +253,29 @@ def process_document(req: ProcessReq):
 
         # 5) save chunks (use 'text' column to match schema)
         try:
-            # delete previous chunks for this document_id (best-effort)
+            # Delete previous chunks (best-effort) — try by uuid and by storage_path
             try:
-                sb.table("chunks").delete().eq("document_id", doc_id).execute()
+                if doc_id:
+                    sb.table("chunks").delete().eq("document_id", doc_id).execute()
             except Exception:
-                # maybe previous rows used storage_path as document_id; try that too
                 try:
                     sb.table("chunks").delete().eq("document_id", storage_path).execute()
                 except Exception:
                     pass
 
-            rows = [{"document_id": doc_id, "chunk_index": i, "text": c} for i, c in enumerate(chunks)]
+            # Create rows using the canonical doc_id (prefer uuid), fallback to storage_path
+            canonical_doc_id = doc_id if doc_id else storage_path
+            rows = [{"document_id": canonical_doc_id, "chunk_index": i, "text": c} for i, c in enumerate(chunks)]
 
             if rows:
                 up = sb.table("chunks").upsert(rows, on_conflict="document_id,chunk_index").execute()
-                # log response shape
-                print("chunks upsert response:", getattr(up, "status_code", None), getattr(up, "data", None))
+                print("chunks upsert response:", getattr(up, "status_code", None), getattr(up, "data", None), getattr(up, "error", None))
         except Exception as e:
             tb = traceback.format_exc()
             print("save chunks error:", e, tb)
             try:
-                sb.table("documents").update({"status": "error"}).eq("id", doc_id).execute()
+                if doc_id and is_uuid(str(doc_id)):
+                    sb.table("documents").update({"status": "error"}).eq("id", doc_id).execute()
             except Exception:
                 pass
             return JSONResponse(status_code=500, content={"ok": False, "error": "save chunks failed", "detail": str(e), "trace": tb})
@@ -249,30 +286,40 @@ def process_document(req: ProcessReq):
                 embeddings = embed_passages([r["text"] for r in rows])
                 upserts = []
                 for r, emb in zip(rows, embeddings):
+                    # ensure embedding is plain python list of floats
+                    vec = emb if isinstance(emb, list) else (emb.tolist() if hasattr(emb, "tolist") else list(emb))
+                    vec = [float(x) for x in vec]
                     upserts.append({
                         "document_id": r["document_id"],
                         "chunk_index": r["chunk_index"],
-                        "text": r["text"],  # keep text to ensure row completeness
-                        "embedding": emb
+                        "embedding": vec
                     })
                 emb_r = sb.table("chunks").upsert(upserts, on_conflict="document_id,chunk_index").execute()
-                print("embedding upsert response:", getattr(emb_r, "status_code", None), getattr(emb_r, "data", None))
+                print("embedding upsert response:", getattr(emb_r, "status_code", None), getattr(emb_r, "data", None), getattr(emb_r, "error", None))
         except Exception as e:
             tb = traceback.format_exc()
             print("embedding error:", e, tb)
             try:
-                sb.table("documents").update({"status": "error"}).eq("id", doc_id).execute()
+                if doc_id and is_uuid(str(doc_id)):
+                    sb.table("documents").update({"status": "error"}).eq("id", doc_id).execute()
             except Exception:
                 pass
             return JSONResponse(status_code=500, content={"ok": False, "error": "embedding failed", "detail": str(e), "trace": tb})
 
         # 7) update doc
         try:
-            sb.table("documents").update({"status": "embedded", "pages": pages}).eq("id", doc_id).execute()
+            if doc_id and is_uuid(str(doc_id)):
+                sb.table("documents").update({"status": "embedded", "pages": pages}).eq("id", doc_id).execute()
+            else:
+                # if no uuid available, try update by storage_path
+                try:
+                    sb.table("documents").update({"status": "embedded", "pages": pages}).eq("storage_path", storage_path).execute()
+                except Exception:
+                    pass
         except Exception as e:
             print("warning: could not update document status:", e)
 
-        return JSONResponse(status_code=200, content={"ok": True, "document_id": doc_id, "pages": pages, "chunks": n_chunks})
+        return JSONResponse(status_code=200, content={"ok": True, "document_id": canonical_doc_id, "pages": pages, "chunks": n_chunks})
     except Exception as e:
         tb = traceback.format_exc()
         print("Unhandled exception in process_document:", e, tb)
@@ -292,7 +339,7 @@ def search(req: SearchReq):
             {"query_embedding": q_vec, "match_count": match_count, "filter_document": req.filter_document_id},
         ).execute()
 
-        items: List[Dict[str, Any]] = rpc.data or []
+        items: List[Dict[str, Any]] = getattr(rpc, "data", None) or []
 
         # Some RPCs may return 'text' field; normalize to 'content'
         normalized = []
