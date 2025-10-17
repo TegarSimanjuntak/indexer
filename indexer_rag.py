@@ -17,10 +17,19 @@ load_dotenv()
 from fastapi import FastAPI, HTTPException, Request, Body
 from pydantic import BaseModel
 from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
+# we no longer import SentenceTransformer directly here (embedder in separate module)
 from supabase import create_client
 import requests
 import numpy as np
+
+# import chunker + embed helper (must be in same folder)
+try:
+    from chunker_embedder import chunk_text, embed_batches
+except Exception as e:
+    # will raise later when used, but log now
+    chunk_text = None
+    embed_batches = None
+    logging.getLogger('indexer').exception('Failed importing chunker_embedder: %s', e)
 
 # --- Config ---
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO')
@@ -31,7 +40,7 @@ SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
 SUPABASE_BUCKET = os.environ.get('SUPABASE_BUCKET', 'documents')
 
-# keep chunk defaults as before unless overridden in env
+# chunk/embedding defaults (can be overridden by env)
 CHUNK_SIZE = int(os.environ.get('CHUNK_SIZE', '1000'))
 CHUNK_OVERLAP = int(os.environ.get('CHUNK_OVERLAP', '200'))
 EMBED_MODEL_NAME = os.environ.get('EMBED_MODEL_NAME', 'intfloat/e5-base-v2')
@@ -48,22 +57,20 @@ try:
 except Exception as e:
     logger.exception('Failed to init supabase client: %s', e)
 
-# Load embedding model once
-logger.info('Loading embedding model: %s', EMBED_MODEL_NAME)
-embed_model = SentenceTransformer(EMBED_MODEL_NAME)
-logger.info('Model loaded')
-
-# infer actual dim
+# --- Attempt to infer embedding dim by a quick embed call (lazy)
+EMBED_DIM_ACTUAL = EMBED_DIM_EXPECTED
 try:
-    sample_emb = embed_model.encode("hello world", convert_to_numpy=True)
-    EMBED_DIM_ACTUAL = int(sample_emb.shape[-1])
-    logger.info('Embedding model dim: %d', EMBED_DIM_ACTUAL)
-    if EMBED_DIM_ACTUAL != EMBED_DIM_EXPECTED:
-        logger.warning('EMBED_DIM_EXPECTED (%d) != actual model dim (%d). Set EMBED_DIM env if needed.',
-                       EMBED_DIM_EXPECTED, EMBED_DIM_ACTUAL)
+    if embed_batches is not None:
+        test_embs = embed_batches(["hello world"], model_name=EMBED_MODEL_NAME, batch_size=1)
+        if test_embs and isinstance(test_embs, list) and len(test_embs[0]) > 0:
+            EMBED_DIM_ACTUAL = int(len(test_embs[0]))
+            logger.info('Detected embedding dim from model %s: %d', EMBED_MODEL_NAME, EMBED_DIM_ACTUAL)
+            if EMBED_DIM_ACTUAL != EMBED_DIM_EXPECTED:
+                logger.warning('EMBED_DIM_EXPECTED (%d) != actual model dim (%d). Set EMBED_DIM env if needed.',
+                               EMBED_DIM_EXPECTED, EMBED_DIM_ACTUAL)
 except Exception as e:
+    logger.exception('Failed infer embedding dim via embed_batches; using EMBED_DIM_EXPECTED=%d', EMBED_DIM_EXPECTED)
     EMBED_DIM_ACTUAL = EMBED_DIM_EXPECTED
-    logger.exception('Failed infer embedding dim; using EMBED_DIM_EXPECTED=%d', EMBED_DIM_EXPECTED)
 
 app = FastAPI(title='RAG Indexer')
 
@@ -165,44 +172,6 @@ def extract_text_from_pdf_bytes(b: bytes) -> str:
     except Exception as e:
         logger.exception('Failed to extract pdf text: %s', e)
         return ''
-
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
-    """Simple chunker: split on paragraphs and assemble into overlapping chunks roughly chunk_size chars."""
-    if not text:
-        return []
-    paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
-    chunks: List[str] = []
-    current = ''
-    for p in paragraphs:
-        if len(current) + len(p) + 1 <= chunk_size:
-            current = (current + '\n' + p).strip() if current else p
-        else:
-            if current:
-                chunks.append(current)
-            if len(p) > chunk_size:
-                start = 0
-                while start < len(p):
-                    end = min(start + chunk_size, len(p))
-                    chunks.append(p[start:end])
-                    start = end - overlap if end - overlap > start else end
-                current = ''
-            else:
-                current = p
-    if current:
-        chunks.append(current)
-
-    if overlap > 0 and len(chunks) > 1:
-        overlapped: List[str] = []
-        for i, c in enumerate(chunks):
-            if i == 0:
-                overlapped.append(c)
-            else:
-                prev = overlapped[-1]
-                back = prev[-overlap:] if len(prev) > overlap else prev
-                merged = (back + '\n' + c).strip()
-                overlapped.append(merged)
-        return overlapped
-    return chunks
 
 def approx_token_count(text: str) -> int:
     return max(1, len(text) // 4)
@@ -320,9 +289,14 @@ async def search_endpoint(payload: Dict[str, Any] = Body(...)):
 
     logger.info('Search request: k=%d filter=%s q="%s"', k, filter_document, query[:120])
 
-    # 1) compute embedding for query
+    # 1) compute embedding for query (use embed_batches to be consistent)
     try:
-        q_emb = embed_model.encode([query], convert_to_numpy=True)[0].tolist()
+        if embed_batches is None:
+            raise RuntimeError('embed_batches not available; ensure chunker_embedder.py is present')
+        q_embs = embed_batches([query], model_name=EMBED_MODEL_NAME, batch_size=1)
+        if not q_embs or not isinstance(q_embs, list):
+            raise RuntimeError('embed_batches returned unexpected result')
+        q_emb = q_embs[0]
     except Exception as e:
         logger.exception('Query embedding failed: %s', e)
         raise HTTPException(status_code=500, detail='query embed failed')
@@ -424,35 +398,43 @@ async def index(payload: IndexPayload, request: Request):
         update_document_status(document_id, 'error')
         raise HTTPException(status_code=500, detail=f'extract failed: {e}')
 
-    # 3) chunk
-    chunks = chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
-    logger.info('Created %d chunks (chunk_size=%d overlap=%d)', len(chunks), CHUNK_SIZE, CHUNK_OVERLAP)
+    # 3) chunk (use sentence-aware chunker from chunker_embedder)
+    if chunk_text is None:
+        logger.error('chunk_text function not available. Ensure chunker_embedder.py is present.')
+        update_document_status(document_id, 'error')
+        raise HTTPException(status_code=500, detail='chunker not available')
+
+    chunks = chunk_text(
+        text,
+        chunk_size=int(os.environ.get('CHUNK_MAX_CHARS', CHUNK_SIZE)),
+        overlap=CHUNK_OVERLAP,
+        by_sentences=True,
+        sentences_per_chunk=int(os.environ.get('CHUNK_SENTENCES', '3')),
+        sentence_overlap=int(os.environ.get('CHUNK_SENTENCE_OVERLAP', '1')),
+        max_chars=int(os.environ.get('CHUNK_MAX_CHARS', CHUNK_SIZE))
+    )
+    logger.info('Created %d chunks (sentence-based, max_chars=%s)', len(chunks), os.environ.get('CHUNK_MAX_CHARS', CHUNK_SIZE))
 
     if not chunks:
         update_document_status(document_id, 'error')
         raise HTTPException(status_code=400, detail='No chunks produced')
 
-    # 4) embed in batches
+    # 4) embed in batches using embed_batches helper
+    if embed_batches is None:
+        logger.error('embed_batches not available. Ensure chunker_embedder.py is present.')
+        update_document_status(document_id, 'error')
+        raise HTTPException(status_code=500, detail='embedder not available')
+
     try:
-        batch_size = 64
-        embeddings: List[List[float]] = []
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i:i+batch_size]
-            logger.info('Embedding batch %d - %d', i, i+len(batch)-1)
-            em = embed_model.encode(batch, show_progress_bar=False, convert_to_numpy=True)
-            for v in em:
-                try:
-                    embeddings.append(np.array(v, dtype=np.float32).tolist())
-                except Exception:
-                    embeddings.append([float(x) for x in list(v)])
+        embeddings = embed_batches(chunks, model_name=EMBED_MODEL_NAME, batch_size=int(os.environ.get('EMBED_BATCH_SIZE', '64')))
     except Exception as e:
-        logger.exception('Embedding failed: %s', e)
+        logger.exception('Embedding failed via embed_batches: %s', e)
         update_document_status(document_id, 'error')
         raise HTTPException(status_code=500, detail=f'embed failed: {e}')
 
     # 5) validate embedding dims quickly
     if len(embeddings) > 0 and len(embeddings[0]) != EMBED_DIM_ACTUAL:
-        logger.warning('Embedding dim mismatch: actual %d vs sample %d', len(embeddings[0]), EMBED_DIM_ACTUAL)
+        logger.warning('Embedding dim mismatch: actual %d vs expected %d', len(embeddings[0]), EMBED_DIM_ACTUAL)
 
     # 6) upsert into Supabase
     try:
