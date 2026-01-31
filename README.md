@@ -131,3 +131,16 @@ Berdasarkan pengujian skripsi menggunakan dokumen **PMBOK® Guide – Seventh Ed
 Apakah ada bagian spesifik lainnya yang ingin kamu tambahkan atau sesuaikan?
 
 ```
+---
+
+## 👤 Dosen Pembimbing
+
+**Dr. Afrida Helen, S.T., M.Kom.**
+
+*
+
+**Dr. Intan Nurma Yulita, S.T., M.T**
+
+* 
+
+---
